@@ -470,7 +470,7 @@ const state = {
   bookings: [
     {id:1, day:0, court:1, start:'19:00', end:'20:00', opp:'G Zimmerman (Visitor)', comp:null},
     {id:2, day:1, court:2, start:'17:30', end:'18:30', opp:null, comp:'Box Games'},
-    {id:3, day:4, court:1, start:'20:00', end:'21:00', opp:'L Marais', comp:null, oppStatus:'pending', oppShare:13.20},
+    {id:3, day:4, court:1, start:'20:00', end:'21:00', opp:'L Marais', comp:null, oppStatus:'pending', oppShare:13.20, fallbackDelta:26.40},
   ],
 };
 
@@ -822,9 +822,10 @@ SCREENS['bookings'] = ()=>{
             <button class="btn btn-sm btn-secondary" onclick="openCancelSheet(${b.id})">Cancel</button>
           </div>
           ${pill?`<div>${pill}</div>`:''}
-          ${b.oppStatus==='pending'?`<div class="row" style="gap:6px; width:100%;">
+          ${b.oppStatus==='pending'?`<div class="row" style="gap:6px; width:100%; flex-wrap:wrap;">
             <button class="btn btn-sm btn-secondary" style="flex:1; border-style:dashed;" onclick="simulateOpponentConfirm(${b.id})">Demo: they confirm</button>
-            <button class="btn btn-sm btn-secondary" style="flex:1; border-style:dashed;" onclick="openResolveSheet(${b.id})">Demo: no response yet</button>
+            <button class="btn btn-sm btn-secondary" style="flex:1; border-style:dashed;" onclick="simulateOpponentUnresolved(${b.id}, 'decline')">Demo: they decline</button>
+            <button class="btn btn-sm btn-secondary" style="flex:1 1 100%; border-style:dashed;" onclick="simulateOpponentUnresolved(${b.id}, 'timeout')">Demo: lights on, still no response</button>
           </div>`:''}
         </div>`;
       }).join('')}
@@ -951,9 +952,14 @@ function renderBookSheet(){
   const lines = computeFee(tier, draftDuration, draftOpp, draftCover);
   const total = lines.reduce((s,l)=>l.mine?s+l.amount:s,0);
   const bal = state.txns[0].bal;
-  const short = total>bal;
   const oppLine = lines.find(l=>l.opp);
   const coveringLine = lines.find(l=>l.covering);
+  // REQ-BOOK-04 (11 Sept 2026): when splitting with a member, the booking member's balance must
+  // cover the FULL solo-equivalent rate up front — not just their own share — since they're the
+  // guaranteed fallback payer if the opponent never confirms by light activation (REQ-OPP-03).
+  const isSplit = draftOpp==='member' && !draftCover;
+  const fallbackTotal = isSplit ? computeFee(tier, draftDuration, 'none', false).reduce((s,l)=>s+l.amount,0) : total;
+  const short = fallbackTotal>bal;
   const body = `
     <div class="row between" style="margin-bottom:12px;">
       <span class="chip on">${iconCourt()} Court ${state.draft.court}</span>
@@ -985,11 +991,12 @@ function renderBookSheet(){
     <div class="card" style="margin-top:6px;">
       ${lines.filter(l=>l.mine).map(l=>`<div class="feeline"><span>${l.label}${l.covering?' (covering both)':''}</span><span class="num">${fmtR(l.amount)}</span></div>`).join('')}
       ${oppLine?`<div class="feeline faint"><span>${draftOppName||'Opponent'}'s share — pending their confirmation</span><span class="num">${fmtR(oppLine.amount)}</span></div>`:''}
-      <div class="feeline total"><span>Your total</span><span class="num">${fmtR(total)}</span></div>
+      <div class="feeline total"><span>Charged now</span><span class="num">${fmtR(total)}</span></div>
+      ${isSplit?`<div class="feeline faint"><span>Reserved — full rate if ${draftOppName||'they'} don't confirm</span><span class="num">${fmtR(fallbackTotal)}</span></div>`:''}
     </div>
-    ${draftOpp==='member' && !draftCover?`<p class="faint" style="font-size:11.5px; margin-top:8px;">${draftOppName||'They'} will get a notification to confirm and pay their share. The slot is booked now either way — only their payment is pending.</p>`:''}
+    ${draftOpp==='member' && !draftCover?`<p class="faint" style="font-size:11.5px; margin-top:8px;">${draftOppName||'They'} will get a notification to confirm and pay their share, any time up until the lights go on for this session. The slot is booked now either way — if they haven't confirmed by then, you're automatically billed the full rate instead, so your balance needs to cover that worst case now, not just your own share.</p>`:''}
     ${draftOpp==='member' && draftCover?`<p class="faint" style="font-size:11.5px; margin-top:8px;">${draftOppName||'They'} will be notified they've been added — no payment requested from them.</p>`:''}
-    ${short?`<div class="pill-warn" style="display:block; text-align:center; padding:8px;">Balance too low — top up R${(total-bal).toFixed(2)} to continue</div>`:''}
+    ${short?`<div class="pill-warn" style="display:block; text-align:center; padding:8px;">Balance too low — top up R${(fallbackTotal-bal).toFixed(2)} to continue${isSplit?' (covers the full-rate fallback, not just your split share)':''}</div>`:''}
     <button class="btn btn-primary" style="margin-top:12px;" ${short?'disabled':''} onclick="confirmBooking(${total})">${short?'Top up to book':'Confirm booking · '+fmtR(total)}</button>
     ${short?`<button class="btn btn-secondary" style="margin-top:8px;" onclick="openTopupSheet(true)">Top up now</button>`:''}
   `;
@@ -1004,8 +1011,11 @@ function confirmBooking(total){
       booking.oppStatus = 'covered';
     } else {
       const lines = computeFee(tier, draftDuration, 'member', false);
+      const myShareAlready = lines.filter(l=>l.mine).reduce((s,l)=>s+l.amount,0);
+      const soloTotal = computeFee(tier, draftDuration, 'none', false).reduce((s,l)=>s+l.amount,0);
       booking.oppStatus = 'pending';
-      booking.oppShare = lines.find(l=>l.opp).amount;
+      booking.oppShare = lines.find(l=>l.opp).amount; // for display: what THEY would pay if they confirm
+      booking.fallbackDelta = soloTotal - myShareAlready; // REQ-OPP-03: what's actually charged if they don't (solo rate minus what's already been charged — not simply their share)
     }
   } else if(draftOpp==='visitor'){
     booking.opp = 'Visitor';
@@ -1043,7 +1053,7 @@ function doCancel(id){
   closeSheet(); render();
 }
 
-/* REQ-OPP-01/03 demo: simulate the opponent's own device confirming their share */
+/* REQ-OPP-01/03 demo: simulate the opponent's own device confirming their share, any time up until light activation */
 function simulateOpponentConfirm(id){
   const b = state.bookings.find(x=>x.id===id);
   if(!b) return;
@@ -1051,28 +1061,23 @@ function simulateOpponentConfirm(id){
   render();
   setTimeout(()=>openSheet('Confirmed ✓', `<div class="emptywrap" style="padding:20px 0 8px;"><svg viewBox="0 0 24 24" stroke="var(--good)"><path d="M20 6 9 17l-5-5"/></svg><p style="font-weight:700;">${b.opp} confirmed and paid their share</p><p class="muted" style="font-size:13px;">This simulates ${b.opp} tapping "Confirm" on their own device — their ${fmtR(b.oppShare)} share is now charged to their own Light Account, not yours.</p></div><button class="btn btn-secondary" onclick="closeSheet()">Close</button>`), 120);
 }
-/* REQ-OPP-03: reminder/resolution when the opponent hasn't confirmed (declined, or reminder deadline passed) */
-function openResolveSheet(id){
+/* REQ-OPP-03: fallback billing — automatic and unconditional, no choice presented to the booking member.
+   Triggers either immediately (opponent explicitly declines) or at light activation (opponent never responded). */
+function simulateOpponentUnresolved(id, reason){
   const b = state.bookings.find(x=>x.id===id);
   if(!b) return;
-  const body = `
-    <p style="font-size:13px;" class="faint">Simulating: ${b.opp} hasn't responded to the confirmation request yet.</p>
-    <p style="font-size:14px; margin-top:8px;">You can pay ${b.opp}'s share yourself so the booking is fully covered, or cancel now while you still can.</p>
-    <div class="card" style="margin-top:10px;"><div class="feeline total"><span>Their share, if you cover it</span><span class="num">${fmtR(b.oppShare)}</span></div></div>
-    <button class="btn btn-primary" style="margin-top:14px;" onclick="resolvePayFull(${id})">Pay the full rate — ${fmtR(b.oppShare)}</button>
-    <button class="btn btn-secondary" style="margin-top:8px;" onclick="closeSheet(); openCancelSheet(${id})">Cancel this booking instead</button>
-  `;
-  openSheet("Opponent hasn't confirmed", body);
-}
-function resolvePayFull(id){
-  const b = state.bookings.find(x=>x.id===id);
-  if(!b) return;
-  const amt = b.oppShare;
+  const amt = b.fallbackDelta;
   const bal = state.txns[0].bal - amt;
-  state.txns.unshift({t:'Court Light Fees', sub:`Covering ${b.opp}'s share · Court ${b.court}`, amt:-amt, bal});
+  state.txns.unshift({t:'Court Light Fees', sub:`${b.opp} didn't confirm · Court ${b.court}`, amt:-amt, bal});
   b.oppStatus = 'covered';
   delete b.oppShare;
-  closeSheet(); render();
+  delete b.fallbackDelta;
+  render();
+  const headline = reason==='decline' ? `${b.opp} declined` : 'Lights on — no response';
+  const detail = reason==='decline'
+    ? `${b.opp} declined to pay their share, so you were billed the full rate immediately — no choice was needed, it's automatic.`
+    : `${b.opp} never confirmed before the session's light activation, so you were automatically billed the full rate — this is a guaranteed fallback, not a prompt asking you to decide.`;
+  setTimeout(()=>openSheet(headline, `<p style="font-size:14px;">${detail}</p><div class="card" style="margin-top:10px;"><div class="feeline total"><span>Charged to you just now</span><span class="num">${fmtR(amt)}</span></div></div><p class="faint" style="font-size:11.5px; margin-top:10px;">You could still have cancelled the booking any time before this per the normal REQ-MANAGE-02 policy — that option doesn't disappear because of this rule.</p><button class="btn btn-secondary" style="margin-top:12px;" onclick="closeSheet()">Close</button>`), 120);
 }
 
 function openTopupSheet(fromShortfall){
