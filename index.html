@@ -470,7 +470,7 @@ const state = {
   bookings: [
     {id:1, day:0, court:1, start:'19:00', end:'20:00', opp:'G Zimmerman (Visitor)', comp:null},
     {id:2, day:1, court:2, start:'17:30', end:'18:30', opp:null, comp:'Box Games'},
-    {id:3, day:4, court:1, start:'20:00', end:'21:00', opp:'L Marais', comp:null},
+    {id:3, day:4, court:1, start:'20:00', end:'21:00', opp:'L Marais', comp:null, oppStatus:'pending', oppShare:13.20},
   ],
 };
 
@@ -551,16 +551,22 @@ function iconTopup(){return `<svg viewBox="0 0 24 24"><path d="M12 4v16M4 12h16"
 function iconVisitor(){return `<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.2" stroke-dasharray="2.4 2.4"/><path d="M5 20c1.4-4 3.8-6 7-6s5.6 2 7 6"/></svg>`;}
 
 /* ================= FEE ENGINE (BRS Section 7.2 / REQ-BOOK-03) ================= */
-function computeFee(tier, minutes, oppType){
-  const per = minutes/30*0.5; // minutes -> hours factor baked in via cents/min below, kept for clarity
+function computeFee(tier, minutes, oppType, cover){
   const base = 0.22, penalty=0.44, familyFlat=0.44;
   let lines = [];
   if(oppType==='none'){
     if(tier==='family'){ lines.push({label:'Court Light Fees', rate:familyFlat, mine:true}); }
     else { lines.push({label:'Court Light Fees', rate:base+penalty, mine:true}); }
   } else if(oppType==='member'){
-    lines.push({label:'Court Light Fees – Shared', rate:base, mine:true});
-    lines.push({label:'Court Light Fees – Shared', rate:base, mine:false, opp:true});
+    if(cover){
+      // REQ-OPP-04: booking member covers the full solo-equivalent rate; opponent named, never billed.
+      if(tier==='family'){ lines.push({label:'Court Light Fees', rate:familyFlat, mine:true, covering:true}); }
+      else { lines.push({label:'Court Light Fees', rate:base+penalty, mine:true, covering:true}); }
+    } else {
+      // REQ-OPP-01 default: split — opponent's share is pending their own confirmation, not charged now.
+      lines.push({label:'Court Light Fees – Shared', rate:base, mine:true});
+      lines.push({label:'Court Light Fees – Shared', rate:base, mine:false, opp:true, pending:true});
+    }
   } else if(oppType==='visitor'){
     if(tier==='family'){ lines.push({label:'Court Light Fees', rate:familyFlat, mine:true}); }
     else{
@@ -787,6 +793,12 @@ SCREENS['schedule'] = ()=>{
   `;
 };
 
+function oppPill(b){
+  if(b.oppStatus==='pending') return `<span class="pill-warn">Awaiting ${b.opp}'s confirmation</span>`;
+  if(b.oppStatus==='confirmed') return `<span class="pill-good">Confirmed by ${b.opp}</span>`;
+  if(b.oppStatus==='covered') return `<span class="pill-accent">You're covering the cost</span>`;
+  return '';
+}
 SCREENS['bookings'] = ()=>{
   const upcoming = state.bookings.slice().sort((a,b)=>a.day-b.day);
   if(upcoming.length===0){
@@ -797,14 +809,23 @@ SCREENS['bookings'] = ()=>{
     <div class="card" style="padding:4px 14px;">
       ${upcoming.map(b=>{
         const d = DAYS[b.day];
-        const within24 = b.day===0;
-        return `<div class="lrow">
-          <div class="ico">${iconCourt()}</div>
-          <div class="meta">
-            <div class="t1">Court ${b.court} · ${d.label} ${d.num}</div>
-            <div class="t2">${b.start}–${b.end}${b.opp?' · vs '+b.opp:''}${b.comp?' · '+b.comp:''}</div>
+        const pill = oppPill(b);
+        return `<div class="lrow" style="align-items:flex-start; flex-direction:column; gap:8px;">
+          <div class="row between" style="width:100%;">
+            <div class="row" style="gap:12px;">
+              <div class="ico">${iconCourt()}</div>
+              <div class="meta">
+                <div class="t1">Court ${b.court} · ${d.label} ${d.num}</div>
+                <div class="t2">${b.start}–${b.end}${b.opp?' · vs '+b.opp:''}${b.comp?' · '+b.comp:''}${b.visitorEmail?' · emailed '+b.visitorEmail:''}</div>
+              </div>
+            </div>
+            <button class="btn btn-sm btn-secondary" onclick="openCancelSheet(${b.id})">Cancel</button>
           </div>
-          <button class="btn btn-sm btn-secondary" onclick="openCancelSheet(${b.id})">Cancel</button>
+          ${pill?`<div>${pill}</div>`:''}
+          ${b.oppStatus==='pending'?`<div class="row" style="gap:6px; width:100%;">
+            <button class="btn btn-sm btn-secondary" style="flex:1; border-style:dashed;" onclick="simulateOpponentConfirm(${b.id})">Demo: they confirm</button>
+            <button class="btn btn-sm btn-secondary" style="flex:1; border-style:dashed;" onclick="openResolveSheet(${b.id})">Demo: no response yet</button>
+          </div>`:''}
         </div>`;
       }).join('')}
     </div>
@@ -920,17 +941,19 @@ function closeSheet(){
   document.getElementById('sheet-scrim').classList.remove('open');
 }
 
-let draftDuration=60, draftOpp='none';
+let draftDuration=60, draftOpp='none', draftCover=false, draftOppName='L Marais', draftVisitorEmail='';
 function openBookSheet(court, time){
-  state.draft.court=court; state.draft.start=time; draftDuration=60; draftOpp='none';
+  state.draft.court=court; state.draft.start=time; draftDuration=60; draftOpp='none'; draftCover=false; draftVisitorEmail='';
   renderBookSheet();
 }
 function renderBookSheet(){
   const tier = state.member && state.member.tier==='family' ? 'family' : 'single';
-  const lines = computeFee(tier, draftDuration, draftOpp);
+  const lines = computeFee(tier, draftDuration, draftOpp, draftCover);
   const total = lines.reduce((s,l)=>l.mine?s+l.amount:s,0);
   const bal = state.txns[0].bal;
   const short = total>bal;
+  const oppLine = lines.find(l=>l.opp);
+  const coveringLine = lines.find(l=>l.covering);
   const body = `
     <div class="row between" style="margin-bottom:12px;">
       <span class="chip on">${iconCourt()} Court ${state.draft.court}</span>
@@ -950,13 +973,22 @@ function renderBookSheet(){
         <button class="${draftOpp==='visitor'?'active':''}" onclick="draftOpp='visitor'; renderBookSheet()">Visitor</button>
       </div>
     </div>
-    ${draftOpp==='member'?`<div class="field"><label>Search members</label><input placeholder="L Marais" value="L Marais"></div>`:''}
-    ${draftOpp==='visitor'?`<div class="field"><label>Visitor name</label><input placeholder="G Zimmerman" value="G Zimmerman"></div>`:''}
+    ${draftOpp==='member'?`<div class="field"><label>Search members</label><input placeholder="L Marais" value="${draftOppName}" oninput="draftOppName=this.value"></div>
+    <div class="field"><label>Light fee</label>
+      <div class="seg">
+        <button class="${!draftCover?'active':''}" onclick="draftCover=false; renderBookSheet()">Split with ${draftOppName||'them'}</button>
+        <button class="${draftCover?'active':''}" onclick="draftCover=true; renderBookSheet()">I'll cover it</button>
+      </div>
+    </div>`:''}
+    ${draftOpp==='visitor'?`<div class="field"><label>Visitor name</label><input placeholder="G Zimmerman" value="G Zimmerman"></div>
+    <div class="field"><label>Visitor email <span class="faint">(optional — sends them the booking details)</span></label><input type="email" placeholder="visitor@example.com" value="${draftVisitorEmail}" oninput="draftVisitorEmail=this.value"></div>`:''}
     <div class="card" style="margin-top:6px;">
-      ${lines.filter(l=>l.mine).map(l=>`<div class="feeline"><span>${l.label}</span><span class="num">${fmtR(l.amount)}</span></div>`).join('')}
-      ${lines.some(l=>l.opp)?`<div class="feeline faint"><span>Opponent's share (billed to them)</span><span class="num">${fmtR(lines.find(l=>l.opp).amount)}</span></div>`:''}
+      ${lines.filter(l=>l.mine).map(l=>`<div class="feeline"><span>${l.label}${l.covering?' (covering both)':''}</span><span class="num">${fmtR(l.amount)}</span></div>`).join('')}
+      ${oppLine?`<div class="feeline faint"><span>${draftOppName||'Opponent'}'s share — pending their confirmation</span><span class="num">${fmtR(oppLine.amount)}</span></div>`:''}
       <div class="feeline total"><span>Your total</span><span class="num">${fmtR(total)}</span></div>
     </div>
+    ${draftOpp==='member' && !draftCover?`<p class="faint" style="font-size:11.5px; margin-top:8px;">${draftOppName||'They'} will get a notification to confirm and pay their share. The slot is booked now either way — only their payment is pending.</p>`:''}
+    ${draftOpp==='member' && draftCover?`<p class="faint" style="font-size:11.5px; margin-top:8px;">${draftOppName||'They'} will be notified they've been added — no payment requested from them.</p>`:''}
     ${short?`<div class="pill-warn" style="display:block; text-align:center; padding:8px;">Balance too low — top up R${(total-bal).toFixed(2)} to continue</div>`:''}
     <button class="btn btn-primary" style="margin-top:12px;" ${short?'disabled':''} onclick="confirmBooking(${total})">${short?'Top up to book':'Confirm booking · '+fmtR(total)}</button>
     ${short?`<button class="btn btn-secondary" style="margin-top:8px;" onclick="openTopupSheet(true)">Top up now</button>`:''}
@@ -964,11 +996,30 @@ function renderBookSheet(){
   openSheet('Book a slot', body);
 }
 function confirmBooking(total){
-  state.bookings.push({id: Date.now(), day: state.selectedDay, court: state.draft.court, start: state.draft.start, end: state.draft.start, opp: draftOpp!=='none'?'New opponent':null, comp:null});
+  const booking = {id: Date.now(), day: state.selectedDay, court: state.draft.court, start: state.draft.start, end: state.draft.start, comp:null};
+  if(draftOpp==='member'){
+    const tier = state.member && state.member.tier==='family' ? 'family' : 'single';
+    booking.opp = draftOppName || 'Opponent';
+    if(draftCover){
+      booking.oppStatus = 'covered';
+    } else {
+      const lines = computeFee(tier, draftDuration, 'member', false);
+      booking.oppStatus = 'pending';
+      booking.oppShare = lines.find(l=>l.opp).amount;
+    }
+  } else if(draftOpp==='visitor'){
+    booking.opp = 'Visitor';
+    booking.visitorEmail = draftVisitorEmail || null;
+  } else {
+    booking.opp = null;
+  }
+  state.bookings.push(booking);
   closeSheet();
   const bal = state.txns[0].bal - total;
   state.txns.unshift({t:'Court Light Fees', sub:`Court ${state.draft.court} · ${state.draft.start} today`, amt:-total, bal});
-  setTimeout(()=>openSheet('Booked ✓', `<div class="emptywrap" style="padding:20px 0 8px;"><svg viewBox="0 0 24 24" stroke="var(--good)"><path d="M20 6 9 17l-5-5"/></svg><p style="font-weight:700;">Court ${state.draft.court} confirmed for ${state.draft.start}</p><p class="muted" style="font-size:13px;">A confirmation email is on its way.</p></div><button class="btn btn-secondary" onclick="closeSheet(); goTab('bookings')">View my bookings</button>`), 120);
+  const emailNote = booking.visitorEmail ? `<p class="muted" style="font-size:13px;">We also emailed the booking details to ${booking.visitorEmail}.</p>` : '';
+  const oppNote = booking.oppStatus==='pending' ? `<p class="muted" style="font-size:13px;">${booking.opp} has been notified to confirm and pay their share.</p>` : (booking.oppStatus==='covered' ? `<p class="muted" style="font-size:13px;">${booking.opp} has been notified — no payment requested from them.</p>` : '');
+  setTimeout(()=>openSheet('Booked ✓', `<div class="emptywrap" style="padding:20px 0 8px;"><svg viewBox="0 0 24 24" stroke="var(--good)"><path d="M20 6 9 17l-5-5"/></svg><p style="font-weight:700;">Court ${state.draft.court} confirmed for ${state.draft.start}</p><p class="muted" style="font-size:13px;">A confirmation email is on its way.</p>${oppNote}${emailNote}</div><button class="btn btn-secondary" onclick="closeSheet(); goTab('bookings')">View my bookings</button>`), 120);
   render();
 }
 
@@ -989,6 +1040,38 @@ function openCancelSheet(id){
 }
 function doCancel(id){
   state.bookings = state.bookings.filter(b=>b.id!==id);
+  closeSheet(); render();
+}
+
+/* REQ-OPP-01/03 demo: simulate the opponent's own device confirming their share */
+function simulateOpponentConfirm(id){
+  const b = state.bookings.find(x=>x.id===id);
+  if(!b) return;
+  b.oppStatus = 'confirmed';
+  render();
+  setTimeout(()=>openSheet('Confirmed ✓', `<div class="emptywrap" style="padding:20px 0 8px;"><svg viewBox="0 0 24 24" stroke="var(--good)"><path d="M20 6 9 17l-5-5"/></svg><p style="font-weight:700;">${b.opp} confirmed and paid their share</p><p class="muted" style="font-size:13px;">This simulates ${b.opp} tapping "Confirm" on their own device — their ${fmtR(b.oppShare)} share is now charged to their own Light Account, not yours.</p></div><button class="btn btn-secondary" onclick="closeSheet()">Close</button>`), 120);
+}
+/* REQ-OPP-03: reminder/resolution when the opponent hasn't confirmed (declined, or reminder deadline passed) */
+function openResolveSheet(id){
+  const b = state.bookings.find(x=>x.id===id);
+  if(!b) return;
+  const body = `
+    <p style="font-size:13px;" class="faint">Simulating: ${b.opp} hasn't responded to the confirmation request yet.</p>
+    <p style="font-size:14px; margin-top:8px;">You can pay ${b.opp}'s share yourself so the booking is fully covered, or cancel now while you still can.</p>
+    <div class="card" style="margin-top:10px;"><div class="feeline total"><span>Their share, if you cover it</span><span class="num">${fmtR(b.oppShare)}</span></div></div>
+    <button class="btn btn-primary" style="margin-top:14px;" onclick="resolvePayFull(${id})">Pay the full rate — ${fmtR(b.oppShare)}</button>
+    <button class="btn btn-secondary" style="margin-top:8px;" onclick="closeSheet(); openCancelSheet(${id})">Cancel this booking instead</button>
+  `;
+  openSheet("Opponent hasn't confirmed", body);
+}
+function resolvePayFull(id){
+  const b = state.bookings.find(x=>x.id===id);
+  if(!b) return;
+  const amt = b.oppShare;
+  const bal = state.txns[0].bal - amt;
+  state.txns.unshift({t:'Court Light Fees', sub:`Covering ${b.opp}'s share · Court ${b.court}`, amt:-amt, bal});
+  b.oppStatus = 'covered';
+  delete b.oppShare;
   closeSheet(); render();
 }
 
