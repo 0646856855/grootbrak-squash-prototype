@@ -470,7 +470,7 @@ const state = {
   bookings: [
     {id:1, day:0, court:1, start:'19:00', end:'20:00', opp:'G Zimmerman (Visitor)', comp:null},
     {id:2, day:1, court:2, start:'17:30', end:'18:30', opp:null, comp:'Box Games'},
-    {id:3, day:4, court:1, start:'20:00', end:'21:00', opp:'L Marais', comp:null, oppStatus:'pending', oppShare:13.20, fallbackDelta:26.40},
+    {id:3, day:4, court:1, start:'20:00', end:'21:00', opp:'L Marais', comp:null, oppStatus:'pending', oppShare:13.20, fallbackDelta:13.20},
   ],
 };
 
@@ -559,9 +559,11 @@ function computeFee(tier, minutes, oppType, cover){
     else { lines.push({label:'Court Light Fees', rate:base+penalty, mine:true}); }
   } else if(oppType==='member'){
     if(cover){
-      // REQ-OPP-04: booking member covers the full solo-equivalent rate; opponent named, never billed.
-      if(tier==='family'){ lines.push({label:'Court Light Fees', rate:familyFlat, mine:true, covering:true}); }
-      else { lines.push({label:'Court Light Fees', rate:base+penalty, mine:true, covering:true}); }
+      // REQ-OPP-04 (corrected): covering a real named member costs the COMBINED SESSION rate —
+      // double the base member rate (44c/min, every tier) — never the higher no-opponent solo
+      // rate, since a real member genuinely played. Tier-independent: Single/Scholar's shared
+      // total and Family's flat rate both land on the same 44c/min.
+      lines.push({label:'Court Light Fees – Shared', rate:base*2, mine:true, covering:true});
     } else {
       // REQ-OPP-01 default: split — opponent's share is pending their own confirmation, not charged now.
       lines.push({label:'Court Light Fees – Shared', rate:base, mine:true});
@@ -954,11 +956,12 @@ function renderBookSheet(){
   const bal = state.txns[0].bal;
   const oppLine = lines.find(l=>l.opp);
   const coveringLine = lines.find(l=>l.covering);
-  // REQ-BOOK-04 (11 Sept 2026): when splitting with a member, the booking member's balance must
-  // cover the FULL solo-equivalent rate up front — not just their own share — since they're the
-  // guaranteed fallback payer if the opponent never confirms by light activation (REQ-OPP-03).
+  // REQ-BOOK-04 (11 Sept 2026, rate corrected same day): when splitting with a member, the booking
+  // member's balance must cover the COMBINED SESSION rate (44c/min, every tier) up front — not the
+  // solo rate, and not just their own share — since they're the guaranteed fallback payer if the
+  // opponent never confirms by light activation (REQ-OPP-03).
   const isSplit = draftOpp==='member' && !draftCover;
-  const fallbackTotal = isSplit ? computeFee(tier, draftDuration, 'none', false).reduce((s,l)=>s+l.amount,0) : total;
+  const fallbackTotal = isSplit ? computeFee(tier, draftDuration, 'member', true).reduce((s,l)=>s+l.amount,0) : total;
   const short = fallbackTotal>bal;
   const body = `
     <div class="row between" style="margin-bottom:12px;">
@@ -1012,10 +1015,10 @@ function confirmBooking(total){
     } else {
       const lines = computeFee(tier, draftDuration, 'member', false);
       const myShareAlready = lines.filter(l=>l.mine).reduce((s,l)=>s+l.amount,0);
-      const soloTotal = computeFee(tier, draftDuration, 'none', false).reduce((s,l)=>s+l.amount,0);
+      const coveringTotal = computeFee(tier, draftDuration, 'member', true).reduce((s,l)=>s+l.amount,0); // REQ-OPP-04's corrected rate: combined session rate, not solo
       booking.oppStatus = 'pending';
       booking.oppShare = lines.find(l=>l.opp).amount; // for display: what THEY would pay if they confirm
-      booking.fallbackDelta = soloTotal - myShareAlready; // REQ-OPP-03: what's actually charged if they don't (solo rate minus what's already been charged — not simply their share)
+      booking.fallbackDelta = coveringTotal - myShareAlready; // REQ-OPP-03 (corrected): combined session rate minus what's already been charged — not the solo rate
     }
   } else if(draftOpp==='visitor'){
     booking.opp = 'Visitor';
